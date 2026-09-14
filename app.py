@@ -1,12 +1,12 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
+import psycopg2
 from datetime import datetime, date, timedelta
 
 # =========================================================
 # WIS INTELLI-WAVE PRO v7.1
 # Modern UI + Daily Operation + Quarterly Laboratory
-# Existing SQLite DB is preserved
+# PostgreSQL / Supabase cloud database
 # =========================================================
 
 st.set_page_config(
@@ -16,111 +16,80 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DB_NAME = "wis_intelli_wave_v7.db"
+DB_LABEL = "Supabase PostgreSQL"
 
 # -----------------------------
-# DATABASE
+# CLOUD DATABASE (SUPABASE / POSTGRESQL)
 # -----------------------------
 def get_conn():
-    return sqlite3.connect(DB_NAME, check_same_thread=False)
+    """Create a secure PostgreSQL connection using Streamlit Secrets."""
+    if "DATABASE_URL" not in st.secrets:
+        raise RuntimeError("DATABASE_URL is not configured in Streamlit Secrets")
+    return psycopg2.connect(st.secrets["DATABASE_URL"], sslmode="require")
 
-def init_db():
+def test_db_connection():
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        cur.close()
+        conn.close()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def query_dataframe(sql_text):
     conn = get_conn()
-    cur = conn.cursor()
-
-    # New daily-operation table. The old plant_records table is untouched.
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS operation_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            record_date TEXT NOT NULL,
-            record_time TEXT,
-            operator TEXT,
-            flow_in REAL,
-            flow_out REAL,
-            ph_in REAL,
-            ph_aer REAL,
-            ph_out REAL,
-            do_aer REAL,
-            sv30 REAL,
-            mlss REAL,
-            chlorine_out REAL,
-            energy_kwh REAL,
-            svi REAL,
-            fm_ratio REAL,
-            hrt REAL,
-            hydraulic_load REAL,
-            sec REAL,
-            overall_status TEXT,
-            note TEXT,
-            created_at TEXT
-        )
-    """)
-
-    # Quarterly / periodic lab table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS laboratory_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sample_date TEXT NOT NULL,
-            report_date TEXT,
-            laboratory_name TEXT,
-            bod REAL,
-            cod REAL,
-            ss REAL,
-            tkn REAL,
-            fecal_coliform REAL,
-            total_coliform REAL,
-            oil_grease REAL,
-            sulfide REAL,
-            tds REAL,
-            ph_lab REAL,
-            note TEXT,
-            created_at TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql_text)
+        rows = cur.fetchall()
+        columns = [d[0] for d in cur.description]
+        return pd.DataFrame(rows, columns=columns)
+    finally:
+        conn.close()
 
 def load_operations(limit=None):
-    conn = get_conn()
-    sql = "SELECT * FROM operation_records ORDER BY record_date DESC, record_time DESC, id DESC"
+    sql_text = "SELECT * FROM operation_records ORDER BY record_date DESC, record_time DESC NULLS LAST, id DESC"
     if limit:
-        sql += f" LIMIT {int(limit)}"
-    df = pd.read_sql_query(sql, conn)
-    conn.close()
-    return df
+        sql_text += f" LIMIT {int(limit)}"
+    return query_dataframe(sql_text)
 
 def load_labs(limit=None):
-    conn = get_conn()
-    sql = "SELECT * FROM laboratory_records ORDER BY sample_date DESC, id DESC"
+    sql_text = "SELECT * FROM laboratory_records ORDER BY sample_date DESC, id DESC"
     if limit:
-        sql += f" LIMIT {int(limit)}"
-    df = pd.read_sql_query(sql, conn)
-    conn.close()
-    return df
+        sql_text += f" LIMIT {int(limit)}"
+    return query_dataframe(sql_text)
+
+def insert_record(table_name, data):
+    allowed_tables = {"operation_records", "laboratory_records", "audit_log"}
+    if table_name not in allowed_tables:
+        raise ValueError("Invalid table name")
+
+    columns = list(data.keys())
+    placeholders = ", ".join(["%s"] * len(columns))
+    column_sql = ", ".join(columns)
+    sql_text = f"INSERT INTO {table_name} ({column_sql}) VALUES ({placeholders})"
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql_text, tuple(data[c] for c in columns))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def save_operation(data):
-    conn = get_conn()
-    cols = ", ".join(data.keys())
-    marks = ", ".join(["?"] * len(data))
-    conn.execute(
-        f"INSERT INTO operation_records ({cols}) VALUES ({marks})",
-        tuple(data.values())
-    )
-    conn.commit()
-    conn.close()
+    insert_record("operation_records", data)
 
 def save_lab(data):
-    conn = get_conn()
-    cols = ", ".join(data.keys())
-    marks = ", ".join(["?"] * len(data))
-    conn.execute(
-        f"INSERT INTO laboratory_records ({cols}) VALUES ({marks})",
-        tuple(data.values())
-    )
-    conn.commit()
-    conn.close()
+    insert_record("laboratory_records", data)
 
-init_db()
+DB_CONNECTED, DB_ERROR = test_db_connection()
 
 # -----------------------------
 # ENGINEERING CALCULATIONS
@@ -517,14 +486,27 @@ with st.sidebar:
     aeration_volume = st.number_input("Aeration Volume (m³)", min_value=1.0, value=60.0, step=1.0)
 
     st.divider()
-    st.success("● Database Connected")
-    st.caption(f"SQLite · {DB_NAME}")
+    if DB_CONNECTED:
+        st.success("● Cloud Database Connected")
+        st.caption("Supabase PostgreSQL · Secure connection")
+    else:
+        st.error("● Database Connection Error")
+        st.caption("ตรวจสอบ Streamlit Secrets / DATABASE_URL")
 
 # -----------------------------
 # LOAD DATA
 # -----------------------------
-ops = load_operations()
-labs = load_labs()
+if DB_CONNECTED:
+    try:
+        ops = load_operations()
+        labs = load_labs()
+    except Exception as e:
+        st.error(f"ไม่สามารถอ่านข้อมูลจาก Cloud Database ได้: {e}")
+        ops = pd.DataFrame()
+        labs = pd.DataFrame()
+else:
+    ops = pd.DataFrame()
+    labs = pd.DataFrame()
 
 latest_op = ops.iloc[0].to_dict() if not ops.empty else {}
 latest_lab = labs.iloc[0].to_dict() if not labs.empty else {}
@@ -755,6 +737,9 @@ elif page == "📝 Daily Operation":
         submitted = st.form_submit_button("💾 Save & Analyze", use_container_width=True)
 
     if submitted:
+        if not DB_CONNECTED:
+            st.error("ยังไม่สามารถบันทึกได้ เพราะ Cloud Database ยังไม่เชื่อมต่อ")
+            st.stop()
         save_operation({
             "record_date": record_date.isoformat(),
             "record_time": record_time.strftime("%H:%M"),
@@ -818,6 +803,9 @@ elif page == "🧪 Laboratory (Quarterly)":
         save_lab_btn = st.form_submit_button("🧪 Save Laboratory Result", use_container_width=True)
 
     if save_lab_btn:
+        if not DB_CONNECTED:
+            st.error("ยังไม่สามารถบันทึกได้ เพราะ Cloud Database ยังไม่เชื่อมต่อ")
+            st.stop()
         save_lab({
             "sample_date": sample_date.isoformat(),
             "report_date": report_date.isoformat(),
@@ -925,14 +913,15 @@ elif page == "📄 Reports":
 # =========================================================
 elif page == "⚙️ Settings":
     st.subheader("⚙️ Settings")
-    st.write("Database:", DB_NAME)
+    st.write("Database:", DB_LABEL)
+    st.write("Cloud status:", "Connected" if DB_CONNECTED else "Connection error")
     st.write("Design Flow:", design_flow, "m³/day")
     st.write("Aeration Volume:", aeration_volume, "m³")
     st.caption("สามารถต่อยอดเป็น User Management, threshold settings และโรงพยาบาลหลายแห่งได้ภายหลัง")
 
 st.markdown(
     "<div class='small-note' style='margin-top:30px;'>"
-    "WIS INTELLI-WAVE PRO v7.1 · Hospital Wastewater Decision Support System"
+    "WIS INTELLI-WAVE PRO v7.1.1 · Cloud PostgreSQL Edition"
     "</div>",
     unsafe_allow_html=True
 )
